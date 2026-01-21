@@ -1,11 +1,10 @@
 // ============================================================
 // NORA VANCE - Agent (Durable Object)
-// Version: 2.0.0 - Session-aware memory + 45min timeout
+// Version: 2.1.0 - Central trial tracking via companion-accounts
 // Changes:
-// - Session timeout reduced to 45 minutes (was 2 hours)
-// - Message history now scoped to current session only
-// - R2 memory system integration with extraction
-// - Recent conversation summaries available for reference
+// - Trial messages now tracked in central D1 via companion-accounts API
+// - Local SQLite still used for sessions, messages, user metadata
+// - trial_exhausted_at set automatically when trial hits 0
 // ============================================================
 
 import Anthropic from '@anthropic-ai/sdk';
@@ -22,7 +21,7 @@ interface Env {
   MEMORY: R2Bucket;
   ANTHROPIC_API_KEY: string;
   TELEGRAM_BOT_TOKEN: string;
-  ACCOUNTS_URL?: string;
+  ACCOUNTS_URL: string;
 }
 
 type UserStatus = 'new' | 'trial' | 'awaiting_email' | 'pending_payment' | 'active' | 'paused' | 'churned';
@@ -53,6 +52,18 @@ interface Session {
   summary?: string;
   message_count: number;
   extraction_done?: number;
+}
+
+interface TrialCheckResult {
+  hasTrialRemaining: boolean;
+  messagesRemaining: number;
+  isNewTrial: boolean;
+}
+
+interface TrialDecrementResult {
+  success: boolean;
+  messagesRemaining: number;
+  trialExpired: boolean;
 }
 
 const TRIAL_MESSAGE_LIMIT = 25;
@@ -121,6 +132,46 @@ export class NoraAgent {
     `);
   }
 
+  // ==================== CENTRAL TRIAL API ====================
+  
+  private async checkTrialStatus(chatId: string): Promise<TrialCheckResult> {
+    try {
+      const response = await fetch(`${this.env.ACCOUNTS_URL}/trial/check`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chatId, character: CHARACTER_NAME })
+      });
+      if (!response.ok) {
+        console.error('Trial check failed:', await response.text());
+        return { hasTrialRemaining: true, messagesRemaining: TRIAL_MESSAGE_LIMIT, isNewTrial: false };
+      }
+      return await response.json() as TrialCheckResult;
+    } catch (error) {
+      console.error('Trial check error:', error);
+      return { hasTrialRemaining: true, messagesRemaining: TRIAL_MESSAGE_LIMIT, isNewTrial: false };
+    }
+  }
+
+  private async decrementTrial(chatId: string): Promise<TrialDecrementResult> {
+    try {
+      const response = await fetch(`${this.env.ACCOUNTS_URL}/trial/decrement`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chatId, character: CHARACTER_NAME })
+      });
+      if (!response.ok) {
+        console.error('Trial decrement failed:', await response.text());
+        return { success: false, messagesRemaining: 0, trialExpired: false };
+      }
+      return await response.json() as TrialDecrementResult;
+    } catch (error) {
+      console.error('Trial decrement error:', error);
+      return { success: false, messagesRemaining: 0, trialExpired: false };
+    }
+  }
+
+  // ==================== FETCH HANDLER ====================
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     
@@ -148,11 +199,12 @@ export class NoraAgent {
         const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
         if (userResult.length === 0) return this.jsonResponse({ error: 'User not found' }, 404);
         const user = userResult[0] as User;
+        const trialStatus = await this.checkTrialStatus(chatId!);
         return this.jsonResponse({ 
           status: user.status, 
           email: user.email,
           account_id: user.account_id,
-          trial_remaining: user.trial_messages_remaining
+          trial_remaining: trialStatus.messagesRemaining
         });
       }
       
@@ -230,6 +282,8 @@ export class NoraAgent {
     }
   }
 
+  // ==================== MESSAGE HANDLER ====================
+
   private async handleMessage(data: {
     content: string;
     chatId: string;
@@ -255,7 +309,6 @@ export class NoraAgent {
       user = newUserResult[0] as User;
     }
     
-    // Always ensure R2 memory exists
     await initializeUserMemory(this.env.MEMORY, chatId, user.first_name);
     
     if (content === '__START__') {
@@ -263,7 +316,6 @@ export class NoraAgent {
       return;
     }
     
-    // Magic link flow
     if (user.status === 'awaiting_email') {
       const trimmedContent = content.trim().toLowerCase();
       if (EMAIL_REGEX.test(trimmedContent)) {
@@ -285,14 +337,18 @@ export class NoraAgent {
       return;
     }
     
-    // Trial limit check
-    if (user.status === 'trial' && user.trial_messages_remaining <= 0) {
-      this.sql.exec(`UPDATE users SET status = 'awaiting_email' WHERE chat_id = ?`, chatId);
-      await this.sendMessage(chatId, `hey ${user.first_name}. i've enjoyed getting to know you. to keep chatting, i just need your email so we can get you set up. what's a good email for you?`);
-      return;
+    if (user.status === 'trial') {
+      const trialStatus = await this.checkTrialStatus(chatId);
+      
+      if (!trialStatus.hasTrialRemaining) {
+        this.sql.exec(`UPDATE users SET status = 'awaiting_email', trial_messages_remaining = 0 WHERE chat_id = ?`, chatId);
+        await this.sendMessage(chatId, `hey ${user.first_name}. i've enjoyed getting to know you. to keep chatting, i just need your email so we can get you set up. what's a good email for you?`);
+        return;
+      }
+      
+      this.sql.exec(`UPDATE users SET trial_messages_remaining = ? WHERE chat_id = ?`, trialStatus.messagesRemaining, chatId);
     }
     
-    // Session management - 45 minute timeout
     const lastSessionResult = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? ORDER BY started_at DESC LIMIT 1`, chatId).toArray();
     const lastSession = lastSessionResult.length > 0 ? lastSessionResult[0] as Session : null;
     
@@ -314,21 +370,22 @@ export class NoraAgent {
       sessionId = lastSession!.id;
     }
     
-    // Store user message
     this.sql.exec(`INSERT INTO messages (chat_id, session_id, role, content, timestamp) VALUES (?, ?, 'user', ?, ?)`, chatId, sessionId, content, now.toISOString());
     this.sql.exec(`UPDATE sessions SET message_count = message_count + 1 WHERE id = ?`, sessionId);
     
-    // Update user stats
     if (user.status === 'trial') {
-      this.sql.exec(`UPDATE users SET message_count = message_count + 1, trial_messages_remaining = trial_messages_remaining - 1, last_message_at = ? WHERE chat_id = ?`, now.toISOString(), chatId);
+      const decrementResult = await this.decrementTrial(chatId);
+      this.sql.exec(`UPDATE users SET message_count = message_count + 1, trial_messages_remaining = ?, last_message_at = ? WHERE chat_id = ?`, 
+        decrementResult.messagesRemaining, now.toISOString(), chatId);
     } else {
       this.sql.exec(`UPDATE users SET message_count = message_count + 1, last_message_at = ? WHERE chat_id = ?`, now.toISOString(), chatId);
     }
     
-    // Generate response with session-scoped messages
-    const response = await this.generateResponse(chatId, sessionId, user, isNewSession);
+    const updatedUserResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
+    const updatedUser = updatedUserResult[0] as User;
     
-    // Store assistant response
+    const response = await this.generateResponse(chatId, sessionId, updatedUser, isNewSession);
+    
     this.sql.exec(`INSERT INTO messages (chat_id, session_id, role, content, timestamp) VALUES (?, ?, 'assistant', ?, ?)`, chatId, sessionId, response, new Date().toISOString());
     this.sql.exec(`UPDATE sessions SET message_count = message_count + 1 WHERE id = ?`, sessionId);
     
@@ -336,12 +393,6 @@ export class NoraAgent {
   }
 
   private async handleEmailSubmission(user: User, email: string): Promise<void> {
-    if (!this.env.ACCOUNTS_URL) {
-      this.sql.exec(`UPDATE users SET status = 'pending_payment', email = ? WHERE chat_id = ?`, email, user.chat_id);
-      await this.sendMessage(user.chat_id, `got it. ${email}. billing system coming soon - for now, keep chatting.`);
-      return;
-    }
-    
     try {
       const response = await fetch(`${this.env.ACCOUNTS_URL}/link/initiate`, {
         method: 'POST',
@@ -376,11 +427,13 @@ export class NoraAgent {
     const memory = await loadHotMemory(this.env.MEMORY, user.chat_id);
     const memoryContext = formatMemoryForPrompt(memory);
     
+    const trialStatus = await this.checkTrialStatus(user.chat_id);
+    
     let welcomeContext: string;
     if (user.status === 'active') {
       welcomeContext = `\n\n[CONTEXT: ${user.first_name} is a paying subscriber coming back. Be warm.]`;
     } else if (isFirstTime) {
-      welcomeContext = `\n\n[CONTEXT: ${user.first_name} just started chatting for the first time. Introduce yourself naturally. They have ${TRIAL_MESSAGE_LIMIT} free messages.]`;
+      welcomeContext = `\n\n[CONTEXT: ${user.first_name} just started chatting for the first time. Introduce yourself naturally. They have ${trialStatus.messagesRemaining} free messages.]`;
     } else {
       welcomeContext = `\n\n[CONTEXT: ${user.first_name} is back. You've talked before. Be casual.]`;
     }
@@ -403,7 +456,6 @@ export class NoraAgent {
   private async generateResponse(chatId: string, sessionId: string, user: User, isNewSession: boolean): Promise<string> {
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
     
-    // KEY: Only load messages from CURRENT session
     const recentMessages = this.sql.exec(
       `SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp ASC`, 
       sessionId
@@ -412,13 +464,12 @@ export class NoraAgent {
     const lastUserMessage = recentMessages.filter(m => m.role === 'user').pop();
     const messageContent = lastUserMessage?.content as string || '';
     
-    // Load memory (includes recent conversation summaries)
     const memory = await loadHotMemory(this.env.MEMORY, chatId);
     const memoryContext = formatMemoryForPrompt(memory);
     
     let trialContext = '';
     if (user.status === 'trial') {
-      const remaining = user.trial_messages_remaining - 1;
+      const remaining = user.trial_messages_remaining;
       if (remaining <= 5 && remaining > 0) {
         trialContext = `\n\n[SYSTEM NOTE: User has ${remaining} free messages remaining. Don't mention this unless natural.]`;
       }
